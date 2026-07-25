@@ -1,8 +1,17 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { authMiddleware, getCurrentUser } from "@/middleware/auth";
+import { validateRequest, projectSchema } from "@/lib/validators/api";
 
-export async function GET() {
+export async function GET(request: Request) {
   try {
+    // Add authentication check
+    const nextReq = request as any;
+    const authResult = await authMiddleware(nextReq);
+    if (authResult.status !== undefined && authResult.status !== 200) {
+      return authResult;
+    }
+
     const projects = await prisma.project.findMany({
       orderBy: { projectCode: "asc" },
     });
@@ -20,18 +29,37 @@ export async function GET() {
 
     return NextResponse.json({ success: true, projects: formatted });
   } catch (error: any) {
+    console.error("Error fetching projects:", error);
     return NextResponse.json({ success: false, error: error.message }, { status: 500 });
   }
 }
 
 export async function POST(request: Request) {
   try {
-    const body = await request.json();
-    const { project_code, name, client_name, location, start_date, end_date } = body;
-
-    if (!project_code || !name) {
-      return NextResponse.json({ success: false, error: "project_code and name are required" }, { status: 400 });
+    // Add authentication and authorization check (admin/manager only)
+    const nextReq = request as any;
+    const authResult = await authMiddleware(nextReq, { requiredRoles: ["admin", "manager"] });
+    if (authResult.status !== undefined && authResult.status !== 200) {
+      return authResult;
     }
+
+    const currentUser = await getCurrentUser(nextReq);
+    
+    // Validate request body
+    const body = await request.json();
+    const validation = projectSchema.safeParse(body);
+    
+    if (!validation.success) {
+      const errors = validation.error.errors.map(err => 
+        `${err.path.join(".")}: ${err.message}`
+      );
+      return NextResponse.json(
+        { success: false, error: "Validation failed", details: errors },
+        { status: 400 }
+      );
+    }
+
+    const { project_code, name, client_name, location, start_date, end_date } = validation.data;
 
     const newProject = await prisma.project.create({
       data: {
@@ -47,7 +75,7 @@ export async function POST(request: Request) {
 
     await prisma.auditLog.create({
       data: {
-        actor: "Admin",
+        actor: currentUser?.name || currentUser?.email || "Admin",
         action: "PROJECT_CREATE",
         details: `Added project ${newProject.projectCode} - ${newProject.name}`,
       },
@@ -67,15 +95,29 @@ export async function POST(request: Request) {
       },
     });
   } catch (error: any) {
+    console.error("Error creating project:", error);
     return NextResponse.json({ success: false, error: error.message }, { status: 500 });
   }
 }
 
 export async function PATCH(request: Request) {
   try {
+    // Add authentication and authorization check (admin only)
+    const nextReq = request as any;
+    const authResult = await authMiddleware(nextReq, { requiredRoles: ["admin"] });
+    if (authResult.status !== undefined && authResult.status !== 200) {
+      return authResult;
+    }
+
+    const currentUser = await getCurrentUser(nextReq);
+    
     const { projectId, status } = await request.json();
+    
     if (!projectId || !status) {
-      return NextResponse.json({ success: false, error: "projectId and status are required" }, { status: 400 });
+      return NextResponse.json(
+        { success: false, error: "projectId and status are required" },
+        { status: 400 }
+      );
     }
 
     const updated = await prisma.project.update({
@@ -85,7 +127,7 @@ export async function PATCH(request: Request) {
 
     await prisma.auditLog.create({
       data: {
-        actor: "Admin",
+        actor: currentUser?.name || currentUser?.email || "Admin",
         action: "PROJECT_UPDATE",
         details: `Updated project ${updated.projectCode} status to ${status}`,
       },
@@ -93,6 +135,7 @@ export async function PATCH(request: Request) {
 
     return NextResponse.json({ success: true, project: updated });
   } catch (error: any) {
+    console.error("Error updating project:", error);
     return NextResponse.json({ success: false, error: error.message }, { status: 500 });
   }
 }

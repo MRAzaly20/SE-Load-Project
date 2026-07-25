@@ -1,18 +1,42 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { authMiddleware, getCurrentUser } from "@/middleware/auth";
+import { timesheetSchema, safeValidate } from "@/lib/validators/api";
+import { 
+  calculateAndCreateAllowance, 
+  validateTimesheetAllocation,
+  getCurrentPayrollPeriod 
+} from "@/services/allowance.service";
 
 export async function GET(request: Request) {
   try {
+    // Add authentication check
+    const nextReq = request as any;
+    const authResult = await authMiddleware(nextReq);
+    if (authResult.status !== undefined && authResult.status !== 200) {
+      return authResult;
+    }
+
+    const currentUser = await getCurrentUser(nextReq);
     const { searchParams } = new URL(request.url);
     const engineerId = searchParams.get("engineerId");
 
-    const where: any = {};
+    // Engineers can only see their own timesheets unless they're manager/admin
+    let whereClause: any = {};
     if (engineerId) {
-      where.engineerId = engineerId;
+      if (currentUser?.role === "engineer" && currentUser.id !== engineerId) {
+        return NextResponse.json(
+          { success: false, error: "Access denied. Engineers can only view their own timesheets." },
+          { status: 403 }
+        );
+      }
+      whereClause.engineerId = engineerId;
+    } else if (currentUser?.role === "engineer") {
+      whereClause.engineerId = currentUser.id;
     }
 
     const timesheets = await prisma.timesheetEntry.findMany({
-      where,
+      where: whereClause,
       orderBy: { createdAt: "desc" },
     });
 
@@ -34,29 +58,45 @@ export async function GET(request: Request) {
 
     return NextResponse.json({ success: true, timesheets: formatted });
   } catch (error: any) {
+    console.error("Error fetching timesheets:", error);
     return NextResponse.json({ success: false, error: error.message }, { status: 500 });
   }
 }
 
 export async function POST(request: Request) {
   try {
-    const body = await request.json();
-    const { engineer_id, project_id, work_date, deployment_status, onsite_activity_type, site_location, hours_logged } = body;
-
-    if (!engineer_id || !project_id || !work_date) {
-      return NextResponse.json({ success: false, error: "engineer_id, project_id, work_date are required" }, { status: 400 });
+    // Add authentication check
+    const nextReq = request as any;
+    const authResult = await authMiddleware(nextReq);
+    if (authResult.status !== undefined && authResult.status !== 200) {
+      return authResult;
     }
 
-    // Check allocation mismatch
-    const allocations = await prisma.resourceAllocation.findMany({
-      where: { engineerId: engineer_id, projectId: project_id },
-    });
+    const currentUser = await getCurrentUser(nextReq);
+    
+    // Validate request body
+    const body = await request.json();
+    const validation = safeValidate(timesheetSchema, body);
+    
+    if (!validation.success) {
+      return NextResponse.json(
+        { success: false, error: "Validation failed", details: validation.errors },
+        { status: 400 }
+      );
+    }
 
-    const isAllocationMismatch = allocations.length === 0;
-    const validationStatus = isAllocationMismatch ? "Flagged" : "Validated";
-    const validationNotes = isAllocationMismatch
-      ? "Allocation mismatch: Engineer is not allocated to this project."
-      : undefined;
+    const { engineer_id, project_id, work_date, deployment_status, onsite_activity_type, site_location, hours_logged } = validation.data;
+
+    // Engineers can only create timesheets for themselves
+    if (currentUser?.role === "engineer" && currentUser.id !== engineer_id) {
+      return NextResponse.json(
+        { success: false, error: "Access denied. Engineers can only log their own timesheets." },
+        { status: 403 }
+      );
+    }
+
+    // Check allocation mismatch using service
+    const allocationCheck = await validateTimesheetAllocation(engineer_id, project_id);
 
     const newTimesheet = await prisma.timesheetEntry.create({
       data: {
@@ -67,45 +107,37 @@ export async function POST(request: Request) {
         onsiteActivityType: onsite_activity_type || "None",
         siteLocation: site_location || null,
         hoursLogged: Number(hours_logged) || 8,
-        validationStatus,
-        validationNotes,
+        validationStatus: allocationCheck.validationStatus,
+        validationNotes: allocationCheck.validationNotes,
         source: "PWA Manual Entry",
       },
     });
 
-    // Auto-calculate Allowance if Onsite and Validated
-    if (validationStatus === "Validated" && deployment_status === "Onsite" && onsite_activity_type !== "None") {
-      const policy = await prisma.allowancePolicy.findUnique({
-        where: { activityType: onsite_activity_type },
+    // Auto-calculate Allowance if Onsite and Validated (using service)
+    if (
+      allocationCheck.validationStatus === "Validated" && 
+      deployment_status === "Onsite" && 
+      onsite_activity_type && 
+      onsite_activity_type !== "None"
+    ) {
+      const allowanceResult = await calculateAndCreateAllowance({
+        engineerId: engineer_id,
+        workDate,
+        deploymentStatus: deployment_status,
+        onsiteActivityType: onsite_activity_type,
+        timesheetEntryId: newTimesheet.id,
       });
 
-      if (policy) {
-        const existingAllowance = await prisma.allowanceRecord.findFirst({
-          where: { engineerId: engineer_id, workDate: work_date },
-        });
-
-        if (!existingAllowance) {
-          await prisma.allowanceRecord.create({
-            data: {
-              timesheetEntryId: newTimesheet.id,
-              engineerId: engineer_id,
-              policyId: policy.id,
-              workDate: work_date,
-              activityType: onsite_activity_type,
-              amountIdr: policy.amountIdr,
-              payrollStatus: "Pending Payroll Approval",
-              payrollPeriod: "July 2026",
-            },
-          });
-        }
+      if (allowanceResult.created) {
+        console.log(`Allowance created: ${allowanceResult.message}`);
       }
     }
 
     await prisma.auditLog.create({
       data: {
-        actor: "Engineer PWA",
+        actor: currentUser?.name || currentUser?.email || "Engineer PWA",
         action: "TIMESHEET_MANUAL_LOG",
-        details: `Logged ${hours_logged}h for ${work_date} (${deployment_status || "Office"}) - Status: ${validationStatus}`,
+        details: `Logged ${hours_logged}h for ${work_date} (${deployment_status || "Office"}) - Status: ${allocationCheck.validationStatus}`,
       },
     });
 
@@ -127,56 +159,57 @@ export async function POST(request: Request) {
       },
     });
   } catch (error: any) {
+    console.error("Error creating timesheet:", error);
     return NextResponse.json({ success: false, error: error.message }, { status: 500 });
   }
 }
 
 export async function PATCH(request: Request) {
   try {
+    // Add authentication and authorization check (manager/admin only)
+    const nextReq = request as any;
+    const authResult = await authMiddleware(nextReq, { requiredRoles: ["manager", "admin"] });
+    if (authResult.status !== undefined && authResult.status !== 200) {
+      return authResult;
+    }
+
+    const currentUser = await getCurrentUser(nextReq);
+    
     const { timesheetId, managerName } = await request.json();
+    
     if (!timesheetId) {
-      return NextResponse.json({ success: false, error: "timesheetId is required" }, { status: 400 });
+      return NextResponse.json(
+        { success: false, error: "timesheetId is required" },
+        { status: 400 }
+      );
     }
 
     const updated = await prisma.timesheetEntry.update({
       where: { id: timesheetId },
       data: {
         validationStatus: "Validated",
-        validationNotes: `Approved by ${managerName || "Manager"}`,
+        validationNotes: `Approved by ${managerName || currentUser?.name || "Manager"}`,
       },
     });
 
-    // Check if allowance should be generated now that it's validated
+    // Check if allowance should be generated now that it's validated (using service)
     if (updated.deploymentStatus === "Onsite" && updated.onsiteActivityType !== "None") {
-      const policy = await prisma.allowancePolicy.findUnique({
-        where: { activityType: updated.onsiteActivityType },
+      const allowanceResult = await calculateAndCreateAllowance({
+        engineerId: updated.engineerId,
+        workDate: updated.workDate,
+        deploymentStatus: updated.deploymentStatus,
+        onsiteActivityType: updated.onsiteActivityType,
+        timesheetEntryId: updated.id,
       });
 
-      if (policy) {
-        const existing = await prisma.allowanceRecord.findFirst({
-          where: { engineerId: updated.engineerId, workDate: updated.workDate },
-        });
-
-        if (!existing) {
-          await prisma.allowanceRecord.create({
-            data: {
-              timesheetEntryId: updated.id,
-              engineerId: updated.engineerId,
-              policyId: policy.id,
-              workDate: updated.workDate,
-              activityType: updated.onsiteActivityType,
-              amountIdr: policy.amountIdr,
-              payrollStatus: "Pending Payroll Approval",
-              payrollPeriod: "July 2026",
-            },
-          });
-        }
+      if (allowanceResult.created) {
+        console.log(`Allowance created on approval: ${allowanceResult.message}`);
       }
     }
 
     await prisma.auditLog.create({
       data: {
-        actor: managerName || "Manager",
+        actor: currentUser?.name || managerName || "Manager",
         action: "TIMESHEET_APPROVE",
         details: `Approved timesheet entry ${timesheetId}`,
       },
@@ -184,6 +217,7 @@ export async function PATCH(request: Request) {
 
     return NextResponse.json({ success: true, timesheet: updated });
   } catch (error: any) {
+    console.error("Error approving timesheet:", error);
     return NextResponse.json({ success: false, error: error.message }, { status: 500 });
   }
 }

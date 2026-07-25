@@ -34,12 +34,28 @@ export const verifyPassword = async (
 };
 
 export const createToken = (payload: any): string => {
-  const secret = process.env.JWT_SECRET || process.env.NEXTAUTH_SECRET || "default_jwt_secret";
+  const secret = process.env.JWT_SECRET || process.env.NEXTAUTH_SECRET;
+  
+  if (!secret || secret.length < 32) {
+    throw new Error(
+      "JWT_SECRET or NEXTAUTH_SECRET must be set and at least 32 characters long. " +
+      "Please configure this in your .env file for security."
+    );
+  }
+  
   return jwt.sign(payload, secret, { expiresIn: "7d" });
 };
 
 export const verifyToken = (token: string): any => {
-  const secret = process.env.JWT_SECRET || process.env.NEXTAUTH_SECRET || "default_jwt_secret";
+  const secret = process.env.JWT_SECRET || process.env.NEXTAUTH_SECRET;
+  
+  if (!secret || secret.length < 32) {
+    throw new Error(
+      "JWT_SECRET or NEXTAUTH_SECRET must be set and at least 32 characters long. " +
+      "Please configure this in your .env file for security."
+    );
+  }
+  
   try {
     return jwt.verify(token, secret);
   } catch (error: any) {
