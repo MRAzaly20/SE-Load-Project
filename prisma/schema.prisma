@@ -1,0 +1,156 @@
+// Prisma schema for Schneider ERP Auth & Operations Management
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                    String               @id @default(cuid())
+  employeeCode          String?              @unique
+  email                 String               @unique
+  emailVerified         DateTime?            @db.Timestamptz(6)
+  name                  String?
+  password              String?
+  image                 String?
+  avatar                String?
+  role                  String               @default("engineer") // "engineer" | "manager" | "admin"
+  department            String?              @default("Schneider Electric Field Engineering")
+  company               String?              @default("Schneider Electric")
+  capacityHoursPerWeek  Int                  @default(40)
+  createdAt             DateTime             @default(now())
+  updatedAt             DateTime             @updatedAt
+
+  accounts              Account[]
+  allocations           ResourceAllocation[]
+  timesheets            TimesheetEntry[]
+  allowanceRecords      AllowanceRecord[]
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type              String
+  provider          String  // "google" | "github" | "credentials"
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  @@unique([provider, providerAccountId])
+}
+
+model Project {
+  id           String               @id @default(cuid())
+  projectCode  String               @unique
+  name         String
+  status       String               @default("Active") // "Planned" | "Active" | "Closed"
+  startDate    String
+  endDate      String
+  clientName   String
+  location     String
+  createdAt    DateTime             @default(now())
+  updatedAt    DateTime             @updatedAt
+
+  allocations  ResourceAllocation[]
+  timesheets   TimesheetEntry[]
+}
+
+model ResourceAllocation {
+  id            String   @id @default(cuid())
+  engineerId    String
+  projectId     String
+  startDate     String
+  endDate       String
+  allocationPct Int      @default(100) // e.g. 50 = 50% FTE
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  engineer      User     @relation(fields: [engineerId], references: [id], onDelete: Cascade)
+  project       Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+}
+
+model TimesheetEntry {
+  id                 String            @id @default(cuid())
+  engineerId         String
+  projectId          String
+  workDate           String
+  deploymentStatus   String            // "Onsite" | "Office"
+  onsiteActivityType String            // "Pre-FAT" | "FAT" | "SAT" | "None"
+  siteLocation       String?
+  hoursLogged        Float             @default(8)
+  validationStatus   String            @default("Validated") // "Validated" | "Pending Review" | "Flagged" | "Approved"
+  validationNotes    String?
+  source             String            @default("PWA Manual Entry") // "Google Forms Webhook" | "PWA Manual Entry"
+  responseId         String?
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+
+  engineer           User              @relation(fields: [engineerId], references: [id], onDelete: Cascade)
+  project            Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  allowanceRecords   AllowanceRecord[]
+}
+
+model AllowancePolicy {
+  id               String            @id @default(cuid())
+  activityType     String            @unique // "Pre-FAT" | "FAT" | "SAT"
+  amountIdr        Float             @default(150000)
+  effectiveFrom    String
+  effectiveTo      String?
+  description      String
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+
+  allowanceRecords AllowanceRecord[]
+}
+
+model AllowanceRecord {
+  id               String          @id @default(cuid())
+  timesheetEntryId String
+  engineerId       String
+  policyId         String
+  workDate         String
+  activityType     String          // "Pre-FAT" | "FAT" | "SAT"
+  amountIdr        Float
+  payrollStatus    String          @default("Pending Payroll Approval") // "Pending Payroll Approval" | "Approved for Payroll" | "Paid"
+  payrollPeriod    String          // e.g. "July 2026"
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  timesheetEntry   TimesheetEntry  @relation(fields: [timesheetEntryId], references: [id], onDelete: Cascade)
+  engineer         User            @relation(fields: [engineerId], references: [id], onDelete: Cascade)
+  policy           AllowancePolicy @relation(fields: [policyId], references: [id], onDelete: Cascade)
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  timestamp DateTime @default(now())
+  actor     String
+  action    String
+  details   String
+}
+
+model StagingSubmission {
+  id                 String   @id @default(cuid())
+  responseId         String   @unique
+  submittedAt        DateTime @default(now())
+  engineerCode       String
+  projectCode        String
+  workDate           String
+  deploymentStatus   String
+  onsiteActivityType String   @default("None")
+  siteLocation       String?
+  hoursLogged        Float    @default(8)
+  signature          String?
+  status             String   @default("Staged") // "Staged" | "Promoted" | "Failed Validation"
+  validationErrors   String?  // JSON stringified string[]
+}
